@@ -1,0 +1,11 @@
+build/
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.exe
+*.d
+*.log
+*.tmp
+*.env
