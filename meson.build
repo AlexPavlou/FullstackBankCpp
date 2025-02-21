@@ -1,4 +1,4 @@
-project('bank', 'cpp', default_options: ['cpp_std=c++17'])
+project('bank', 'cpp', version: '0.1', default_options: ['cpp_std=c++17'])
 
 cpp_compiler = meson.get_compiler('cpp')
 
@@ -7,13 +7,12 @@ pg = dependency('libpq', required: true)
 hiredis_dep = dependency('hiredis', required: true)
 
 # Directories
-inc_dirs = include_directories('include')
+inc_dirs = include_directories('../include')
 
 # Source files
 src_files = files('src/bank.cpp')
 
-# Executable
 executable('bank', src_files,
-    dependencies: [pg, hiredis_dep],
-    include_directories: inc_dirs
+    include_directories : inc_dirs,
+    link_args : ['-lpqxx', '-lpq', '-lredis++', '-lhiredis', '-lcurl', '-lsodium', '-lcrypto', '-lpthread', '-lz'],
 )
