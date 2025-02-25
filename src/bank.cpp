@@ -1,11 +1,11 @@
 #include <iostream> 
 #include <string>
-#include "crow_all.h"
+#include "../include/crow_all.h"
 //#include "../include/dotenv.h"
+#include <jwt-cpp/jwt.h>
 #include <sstream>
 #include <iomanip>
 #include <sw/redis++/redis++.h>
-#include "jwt/jwt.hpp"
 #include <ctime>
 #include <sodium.h>
 #include <curl/curl.h>
@@ -436,22 +436,36 @@ std::string generateRandomJTI() {
     return std::to_string(dist(gen));
 }
 
-std::string generateJWT(const std::string& user_id) {
-    using namespace jwt::params;
+std::string generateJWT(int user_id, const std::string& secret_key) {
+    auto now = std::chrono::system_clock::now();
+    auto exp = now + std::chrono::minutes(30);
 
-    // Create the JWT object with HS256 algorithm and secret key
-    jwt::jwt_object obj{algorithm("HS256"), secret("your-secret-key"), payload({{"user", user_id}})};
-    
-    // Add claims to the payload
-    obj.add_claim("iss", "app_auth")  // Set the issuer
-       .add_claim("sub", user_id)   // Set user ID as the subject
-       .add_claim("jti", generateRandomJTI())  // Set the JTI (randomly generated)
-       .add_claim("iat", std::chrono::system_clock::now())  // Set issued at time
-       .add_claim("exp", std::chrono::system_clock::now() + std::chrono::minutes{30});  // Set expiration to 15 mins
+    auto token = jwt::create()
+        .set_type("JWS")
+        .set_issuer("auth0")
+        .set_payload_claim("user_id", jwt::claim(std::to_string(user_id)))
+        .set_payload_claim("exp", jwt::claim(std::to_string(std::chrono::duration_cast<std::chrono::seconds>(exp.time_since_epoch()).count()))) // Convert to string
+        .set_payload_claim("jti", jwt::claim(generateRandomJTI())) // Unique token ID
+        .sign(jwt::algorithm::hs256{secret_key});
 
-    return obj.signature();
+    return token;
 }
 
+bool validateJWT(const std::string& token, const std::string& secret_key) {
+    auto decoded_token = jwt::decode(token);
+
+    auto verifier = jwt::verify()
+        .with_issuer("app_auth")
+        .allow_algorithm(jwt::algorithm::hs256{secret_key});
+
+    try {
+        verifier.verify(decoded_token);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Token verification failed: " << e.what() << std::endl;
+        return false;
+    }
+}
 
 int getUserIdByUsername(pqxx::connection& db, const std::string username) {
     try {
@@ -486,6 +500,46 @@ std::string generateRandomString(size_t length) {
 
 bool isTokenBlacklisted(const std::string& jti) {
     return redis->exists(jti) > 0;
+}
+
+std::optional<jwt::decoded_jwt<jwt::traits::kazuho_picojson>> parseJWT(const std::string& token) {
+    try {
+        auto decoded = jwt::decode(token);
+        auto verifier = jwt::verify()
+            .allow_algorithm(jwt::algorithm::hs256{JWT_SECRET})
+            .with_issuer("app_auth");
+        verifier.verify(decoded);  // Verify signature
+        return decoded;  // Return decoded JWT if valid
+    } catch (const std::exception& e) {
+        return std::nullopt;  // Return nullopt if invalid or error occurs
+    }
+}
+
+bool isValidToken(const crow::request& req, int* user_id = nullptr) {
+    std::string authHeader = req.get_header_value("Authorization");
+    if (authHeader.empty() || authHeader.substr(0, 7) != "Bearer ") {
+        return false; // Missing or malformed token
+    }
+
+    std::string token = authHeader.substr(7);  // Extract token part
+
+    // Parse and verify the JWT
+    auto decoded = parseJWT(token);
+    if (!decoded) {
+        return false; // Invalid token
+    }
+
+    // Check if the token is blacklisted
+    std::string jti = decoded->get_payload_claim("jti").as_string();
+    if (isTokenBlacklisted(jti)) {
+        return false; // Token revoked
+    }
+
+    if (user_id) {
+        *user_id = decoded->get_payload_claim("user_id").to_json().get<int>();
+    }
+
+    return true; // Valid token
 }
 
 bool updateAccountBalanceInDB(pqxx::connection& db, double balance, int account_id) {
@@ -775,11 +829,64 @@ pqxx::connection* initializeDatabase() {
 }
 
 void setupRoutes(crow::SimpleApp& app, pqxx::connection& db) {
+    // Login route
+    CROW_ROUTE(app, "/login").methods("POST"_method)([&db](const crow::request& req) {
+        auto body = crow::json::load(req.body);
+        if (!body || !body.has("username") || !body.has("password")) {
+            return crow::response(400, "Invalid JSON structure");
+        }
+
+        std::string username = body["username"].s();
+        std::string password = body["password"].s();
+
+        // Verify credentials
+        if (verifyLoginCredentials(db, username, password)) {
+            int user_id = getUserIdByUsername(db, username);
+            if (user_id==0) {
+                return crow::response(500, "Internal Server Error: Could not retrieve user id.");
+            }
+
+            std::string token = generateJWT(user_id, JWT_SECRET);
+
+            // Return success with the token
+            return crow::response(200, crow::json::wvalue{{"message", "Login successful"}, {"token", token}}.dump());
+        } else {
+            return crow::response(401, "Unauthorized");
+        }
+    });
+
     // Signup route
+    CROW_ROUTE(app, "/signup").methods("POST"_method)([&db](const crow::request& req) {
+        auto body = crow::json::load(req.body);
+        if (!body || !body.has("username") || !body.has("password") || !body.has("e-mail")) {
+            return crow::response(400, "Invalid JSON structure.");
+        }
+
+        std::string username = body["username"].s();
+        std::string password = body["password"].s();
+        std::string email = body["email"].s();
+        bool two_fa = body.has("two_fa") ? body["two_fa"].b() : false;
+
+        if (userExists(db, username, email)) {
+            return crow::response(409, "Conflict: User already exists.");
+        }
+
+        if (!insertUser(db, username, password, email, two_fa)) {
+            return crow::response(500, "Internal Server Error: Could not create user.");
+        }
+
+        int user_id = getUserIdByUsername(db, username);
+        std::string token = generateJWT(user_id, JWT_SECRET);
+
+        return crow::response(201, crow::json::wvalue{{"message", "User registered & logged in successfully"}, {"token", token}}.dump());
+    });
 	CROW_ROUTE(app, "/transactions").methods("POST"_method)([&db](const crow::request& req) {
 		auto body = crow::json::load(req.body);
 		if (!body || !body.has("account_id")) {
 			return crow::response(400, "Invalid JSON structure");
+		}
+		if (!isValidToken(req)) {
+			return crow::response(401, "Unauthorized: Invalid or missing token");
 		}
 
 		std::string account_id = body["account_id"].s();
@@ -822,6 +929,9 @@ void setupRoutes(crow::SimpleApp& app, pqxx::connection& db) {
 		}
 		std::string token = authHeader.substr(7);
 		int user_id = 0;
+		if (!isValidToken(req, &user_id)) {
+			return crow::response(401, "Unauthorized: Invalid or missing token");
+		}
 
 		// Query accounts from the database.
 		pqxx::work txn(db);
@@ -852,10 +962,41 @@ void setupRoutes(crow::SimpleApp& app, pqxx::connection& db) {
 		resp.add_header("Content-Type", "application/json");
 		return resp;
 	});
+    CROW_ROUTE(app, "/logout").methods("POST"_method)([](const crow::request& req) {
+        if (!isValidToken(req)) {
+            return crow::response(401, "Unauthorized: Invalid or missing token");
+        }
+
+        // Extract the token and JTI from the request again
+        std::string authHeader = req.get_header_value("Authorization");
+        std::string token = authHeader.substr(7);  // Extract token part
+        auto decoded = parseJWT(token);
+        if (!decoded) {
+            return crow::response(401, "Unauthorized: Invalid or missing token");
+        }
+
+        std::string jti = decoded->get_payload_claim("jti").as_string();
+        int exp = decoded->get_payload_claim("exp").to_json().get<int>();
+
+        int ttl = exp - std::time(nullptr);
+        if (ttl > 0) {
+            try {
+                redis->set(jti, "blacklisted", std::chrono::seconds(ttl));
+            } catch (const sw::redis::Error& e) {
+                logError("Error setting value in Redis: ", e.what());
+                return crow::response(500, "Internal Server Error");
+            }
+        }
+        return crow::response(200, "Logged out successfully");
+    });
     CROW_ROUTE(app, "/transfer").methods("POST"_method)([&db](const crow::request& req) {
         auto body = crow::json::load(req.body);
         if (!body || !body.has("from_account_id") || !body.has("to_account_id") || !body.has("amount")) {
             return crow::response(400, "Invalid JSON structure");
+        }
+
+        if (!isValidToken(req)) {
+            return crow::response(401, "Unauthorized: Invalid or missing token");
         }
 
         int from_account_id = body["from_account_id"].i();
@@ -875,6 +1016,9 @@ void setupRoutes(crow::SimpleApp& app, pqxx::connection& db) {
         int user_id{};
 
         // Validate the token
+        if (!isValidToken(req, &user_id)) {
+            return crow::response(401, "Unauthorized: Invalid or missing token");
+        }
         pqxx::work txn(db);
         pqxx::result res = txn.exec_params("SELECT email, two_fa_enabled, username, created_at FROM accounts WHERE account_id = $1", user_id);
 
@@ -898,6 +1042,10 @@ void setupRoutes(crow::SimpleApp& app, pqxx::connection& db) {
             return crow::response(400, "Invalid JSON structure");
         }
 
+        if (!isValidToken(req)) {
+            return crow::response(401, "Unauthorized: Invalid or missing token");
+        }
+
         std::string email = body["e-mail"].s();
         if (!emailExists(db, email)) {
             return crow::response(404, "E-mail not found");
@@ -916,6 +1064,10 @@ void setupRoutes(crow::SimpleApp& app, pqxx::connection& db) {
     CROW_ROUTE(app, "/reset-password").methods("POST"_method)([&db](const crow::request& req) {
         int user_id;  
         auto body = crow::json::load(req.body);
+
+        if (!isValidToken(req, &user_id)) {
+            return crow::response(401, "Unauthorized: Invalid or missing token");
+        }
 
         if (!body || !body.has("token") || !body.has("new_password")) {
             return crow::response(400, "Invalid request, token and new password are required");
